@@ -33,7 +33,35 @@ All user data travels browser-to-browser over WebRTC data channels. There is no 
 - **Signalling vs data.** The broker only exchanges connection setup (SDP/ICE). Chat, notes, and files never touch it.
 - **Chat.** Messages are broadcast with unique IDs (de-duplicated) and ordered by a Lamport counter. Newcomers receive the history from the peers they connect to. Join and leave notices are kept in a separate list, so new messages never erase them.
 - **Notes.** Last-writer-wins on the whole document, using a Lamport clock with slot ID as tie-break. Remote updates keep your caret in place. Newcomers receive the current notes on join.
-- **Files.** Only metadata is broadcast. The owner streams the file in 16 KB chunks on request, with back-pressure on the data channel, and the receiver reassembles it into a downloadable Blob. The owner must stay online.
+- **Files.** Only metadata is broadcast. The owner streams the file in 16 KB chunks on request, with back-pressure on the data channel, and the receiver reassembles it into a downloadable Blob. The owner must stay online. See [File transfer in detail](#file-transfer-in-detail) below.
+
+## File transfer in detail
+*Implemented by Arnav Verma.*
+
+Files are never uploaded anywhere. Sharing a file only announces that it exists; the bytes move directly from the owner's browser to the person who asks for them.
+
+### The flow
+1. **Offering a file.** When someone drops or selects a file, the app broadcasts only its metadata (file ID, name, size, type and owner slot) to every connected peer. The file itself stays in the owner's browser, so nothing large is sent until someone actually wants it.
+2. **Showing it in the room.** Every peer adds the metadata to its file list and draws a file card with a type icon, the size and a **Get** button. Names are shown with `textContent` only.
+3. **Requesting.** Clicking **Get** sends a small request message straight to the owner over the data channel they already share. Nobody else is involved.
+4. **Sending.** The owner slices the file into 16 KB chunks and sends each one with its file ID, index and total count. Before each chunk, the sender checks how much data is still waiting in the channel's buffer. If the buffer is above a limit, it pauses and resumes when the browser signals that the buffer has drained (back-pressure).
+5. **Receiving.** The receiver stores each chunk by its index and moves the progress bar forward. When every index has been filled, the file is assembled and a download is offered.
+6. **Large files.** Files over 25 MB are written straight to disk chunk by chunk where the File System Access API exists (Chrome/Edge). Other browsers show a warning before the file is loaded into memory. The hard cap is 100 MB.
+7. **Late joiners.** The file catalogue is part of the `hello` message every peer sends on connect, so a newcomer sees all existing files and can request any of them from its owner.
+8. **Owner leaves.** If the owner disconnects, its files are marked unavailable and the **Get** button is disabled. A transfer in progress is stopped and shows an error instead of hanging.
+
+### Safety checks on files
+- File names are limited to 255 characters and a `hello` may list at most 100 files.
+- File chunks are accepted only from the file's owner.
+- A chunk's index must be within the file's range and its size must be valid, or it is dropped.
+- Files above 100 MB are refused at the offering stage, before anything is broadcast.
+
+### How we tested it
+- Small files (a few KB), medium files (about 5 MB), large files (about 30 MB, which takes the disk-streaming path) and a file just under the 100 MB cap.
+- Two devices on the same Wi-Fi, and two devices on different networks (laptop on campus Wi-Fi, phone on mobile data) to exercise the TURN fallback.
+- A third peer joining after a file was already shared, to check that the catalogue arrives in `hello`.
+- Closing the owner's tab in the middle of a transfer, to check that the receiver shows an error instead of freezing.
+- Dropping the same file twice, and requesting the same file from two peers at once.
 
 ## Technical challenges in the design
 These are the design-level challenges we had to solve (lettered so they are not confused with the numbered problems in the next section).
@@ -97,6 +125,30 @@ Problem 8 (fake identities) is **not** solved: anyone can type any name, and we 
 - **What we tried:** We could not show an "incorrect password" message, because the app cannot tell the difference between an empty room and a wrong password.
 - **Final solution:** If nobody connects within 20 seconds, the chat prints a hint to check that the room code and password match exactly, or to try a phone hotspot. The README documents this behaviour.
 
+### 7. Receiving a large file froze or crashed the tab
+- **Problem:** Downloading a file of a few hundred MB made the receiving tab slow, then crash.
+- **Why it happened:** Every chunk was kept in memory, and building the final Blob needed a second copy of the data, so memory use was roughly double the file size.
+- **What we tried:** We first joined the chunks into one big buffer as they arrived. That used the same amount of memory and only moved the crash to a later point in the transfer.
+- **Final solution:** Files over 25 MB are written chunk by chunk straight to disk with the File System Access API (Chrome/Edge), so they never sit fully in memory. Browsers without that API show a warning before loading the file into memory, and there is a hard cap of 100 MB.
+
+### 8. The sender flooded the data channel
+- **Problem:** Sending a big file made the sender's tab laggy, and on slow connections the transfer stalled or failed halfway.
+- **Why it happened:** A plain loop can queue chunks much faster than the network can send them. The data channel's internal buffer keeps growing until the browser struggles or closes the channel.
+- **What we tried:** We added a fixed short delay between chunks. That was too slow on fast connections and still overflowed on slow ones, because no single delay suits every network.
+- **Final solution:** The sender watches the channel's buffered amount. When it passes a limit, the sender pauses and carries on only when the browser reports that the buffer has drained. The speed now adapts to the connection by itself.
+
+### 9. Duplicate, out-of-range or fake chunks corrupted a download
+- **Problem:** A downloaded file could come out with the wrong size or with garbage inside it.
+- **Why it happened:** Any connected peer can send a chunk message for any file, and chunks can be repeated, for example after a retry. The first version trusted the index and size in each message.
+- **What we tried:** We counted the chunks received and finished the download when the count reached the total. A duplicate chunk was counted twice, so the file was declared complete while a real chunk was still missing.
+- **Final solution:** Chunks are stored by index, so a duplicate overwrites itself instead of raising the count. A chunk is accepted only if it comes from the file's owner, its index is within range and its size is valid. The download finishes only when every index has been filled.
+
+### 10. A transfer hung forever when the owner left
+- **Problem:** If the owner closed their tab in the middle of a transfer, the receiver's progress bar stopped and never moved or showed an error.
+- **Why it happened:** The receiver was waiting for chunks from a peer that no longer existed, and nothing told it to stop waiting.
+- **What we tried:** A fixed timeout on the whole transfer. It cut off slow but healthy transfers on weak connections, so we dropped it.
+- **Final solution:** The receiver now listens for the owner's connection closing. When that happens, the transfer is cancelled, the card shows "owner left", and the **Get** button is disabled until the owner is back online and shares the file again.
+
 ## Optional room password
 On the join screen, click **Add a password (optional)**. The password is stretched with PBKDF2-SHA256 (100,000 rounds, salted with the room code) and the result becomes part of the room's peer IDs, so only people who enter the same room code **and** password find each other. Notes:
 - A wrong password does not show an error; it lands you in a different, empty room. The chat hints at this if nobody connects after 20 seconds.
@@ -113,6 +165,7 @@ Light/dark theme toggle, status indicator, avatar stack of who is online, chat b
 - Display names are not unique and are not verified.
 - There is no rate limiting, so a malicious peer could still flood a room with valid messages.
 - Notes use last-writer-wins on the whole document, so two people typing at the exact same moment can overwrite each other's change.
+- Streaming large files straight to disk works only in Chrome and Edge; other browsers hold the whole file in memory.
 - Relies on free public services (PeerJS broker, STUN, Open Relay TURN) that could be slow or unavailable.
 
 ## Privacy note
@@ -131,12 +184,12 @@ Screenshots taken on the live link:
 *Two people online (connected as slot 2), join notices in the chat, and the shared notes pad showing the last editor.*
 
 ![Shared notes edited by two people at once](screenshots/03b-notes-two-people.png)
-*Two people typing in the notes at the same moment. This is the last-writer-wins limitation described below.*
+*Two people typing in the notes at the same moment. This is the last-writer-wins limitation described above.*
 
 ## Team contributions
 | Member | Commits / area |
 |---|---|
 | Yuvraj Dhiman | UI and styling |
 | Pankaj Singh | Shared notes |
-| Arnav Verma | File transfer |
+| Arnav Verma | File transfer: chunked streaming, back-pressure, progress bars, disk streaming for large files, chunk validation, owner-left handling |
 | Vipransh Sharma | P2P mesh |
